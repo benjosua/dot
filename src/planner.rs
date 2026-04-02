@@ -305,22 +305,22 @@ fn plan_for_target(
         mode: None,
     });
 
-    if let Some(mode) = desired.mode {
-        if !matches!(desired.kind, TargetKind::Symlink) {
-            ops.push(Operation {
-                kind: OperationKind::SetMode,
-                package: Some(desired.package.clone()),
-                target: desired.target.clone(),
-                source: None,
-                source_rel: Some(desired.source_rel.clone()),
-                content_hash: Some(desired.desired_hash.clone()),
-                requires_privilege: false,
-                blocked: false,
-                reason: None,
-                diff: None,
-                mode: Some(mode),
-            });
-        }
+    if let Some(mode) = desired.mode
+        && !matches!(desired.kind, TargetKind::Symlink)
+    {
+        ops.push(Operation {
+            kind: OperationKind::SetMode,
+            package: Some(desired.package.clone()),
+            target: desired.target.clone(),
+            source: None,
+            source_rel: Some(desired.source_rel.clone()),
+            content_hash: Some(desired.desired_hash.clone()),
+            requires_privilege: false,
+            blocked: false,
+            reason: None,
+            diff: None,
+            mode: Some(mode),
+        });
     }
 
     PlannedTarget::Ops(ops)
@@ -529,6 +529,64 @@ mod test {
             diagnostics
                 .iter()
                 .any(|diag| matches!(diag.severity, Severity::Error))
+        );
+    }
+
+    #[test]
+    fn copy_targets_schedule_mode_changes() {
+        let desired = DesiredTarget {
+            package: "assets".into(),
+            source_rel: PathBuf::from("assets/wallpaper.png"),
+            source_abs: PathBuf::from("/repo/assets/wallpaper.png"),
+            target: PathBuf::from("/tmp/wallpaper.png"),
+            kind: TargetKind::Copy,
+            mode: Some(0o644),
+            desired_hash: "abc".into(),
+            rendered_text: None,
+            render_cache_path: None,
+        };
+
+        let ops = match plan_for_target(&desired, None, &ObservedTarget::Missing, true) {
+            PlannedTarget::Ops(ops) => ops,
+            PlannedTarget::Clean => panic!("expected planned operations"),
+        };
+
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OperationKind::CreateCopy))
+        );
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OperationKind::SetMode) && op.mode == Some(0o644))
+        );
+    }
+
+    #[test]
+    fn symlink_targets_do_not_schedule_mode_changes() {
+        let desired = DesiredTarget {
+            package: "zsh".into(),
+            source_rel: PathBuf::from("zsh/.zshrc"),
+            source_abs: PathBuf::from("/repo/zsh/.zshrc"),
+            target: PathBuf::from("/tmp/.zshrc"),
+            kind: TargetKind::Symlink,
+            mode: Some(0o644),
+            desired_hash: "abc".into(),
+            rendered_text: None,
+            render_cache_path: None,
+        };
+
+        let ops = match plan_for_target(&desired, None, &ObservedTarget::Missing, true) {
+            PlannedTarget::Ops(ops) => ops,
+            PlannedTarget::Clean => panic!("expected planned operations"),
+        };
+
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op.kind, OperationKind::CreateSymlink))
+        );
+        assert!(
+            ops.iter()
+                .all(|op| !matches!(op.kind, OperationKind::SetMode))
         );
     }
 }

@@ -88,10 +88,12 @@ pub fn discover(
                 runtime,
                 cache_root,
                 &context,
-                &package_name,
-                source_rel,
-                source_abs,
-                package_config.and_then(|pkg| pkg.files.get(&source_key)),
+                ResolveInput {
+                    package_name: &package_name,
+                    source_rel,
+                    source_abs,
+                    file_config: package_config.and_then(|pkg| pkg.files.get(&source_key)),
+                },
             )? {
                 desired.push(target);
             }
@@ -116,10 +118,12 @@ pub fn discover(
                     runtime,
                     cache_root,
                     &context,
-                    &package_name,
-                    source_rel,
-                    source_abs,
-                    Some(package_config.files.get(source_key).expect("present")),
+                    ResolveInput {
+                        package_name: &package_name,
+                        source_rel,
+                        source_abs,
+                        file_config: Some(package_config.files.get(source_key).expect("present")),
+                    },
                 )? {
                     desired.push(target);
                 }
@@ -134,16 +138,27 @@ pub fn discover(
     })
 }
 
+struct ResolveInput<'a> {
+    package_name: &'a str,
+    source_rel: PathBuf,
+    source_abs: PathBuf,
+    file_config: Option<&'a FileConfig>,
+}
+
 fn resolve_desired(
     manifest: &Manifest,
     runtime: &RuntimeContext,
     cache_root: &Path,
     context: &serde_json::Value,
-    package_name: &str,
-    source_rel: PathBuf,
-    source_abs: PathBuf,
-    file_config: Option<&FileConfig>,
+    input: ResolveInput<'_>,
 ) -> Result<Option<DesiredTarget>> {
+    let ResolveInput {
+        package_name,
+        source_rel,
+        source_abs,
+        file_config,
+    } = input;
+
     if !matches(file_config.and_then(|cfg| cfg.when.as_ref()), runtime) {
         return Ok(None);
     }
@@ -329,5 +344,77 @@ mod test {
                 .as_ref()
                 .is_some_and(|path| path.exists())
         );
+    }
+
+    #[test]
+    fn discovery_reports_missing_configured_sources() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("git")).unwrap();
+
+        let runtime = RuntimeContext {
+            host: "test".into(),
+            os: RuntimeOs::Linux,
+            env: BTreeMap::new(),
+        };
+        let cache = dir.path().join("cache");
+        let manifest = Manifest {
+            packages: BTreeMap::from([(
+                "git".into(),
+                crate::config::PackageConfig {
+                    enabled: Some(true),
+                    files: BTreeMap::from([(
+                        "git/.config/git/config".into(),
+                        FileConfig::default(),
+                    )]),
+                },
+            )]),
+            ..Manifest::default()
+        };
+
+        let result = discover(dir.path(), &manifest, &[], &runtime, &cache).unwrap();
+        assert!(result.desired.is_empty());
+        assert!(result.diagnostics.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("references missing source git/.config/git/config")
+        }));
+    }
+
+    #[test]
+    fn discovery_skips_files_when_selectors_do_not_match() {
+        let dir = tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("git")).unwrap();
+        fs::write(dir.path().join("git/.gitconfig"), "[user]\nname = test\n").unwrap();
+
+        let runtime = RuntimeContext {
+            host: "workstation".into(),
+            os: RuntimeOs::Linux,
+            env: BTreeMap::new(),
+        };
+        let cache = dir.path().join("cache");
+        let manifest = Manifest {
+            packages: BTreeMap::from([(
+                "git".into(),
+                crate::config::PackageConfig {
+                    enabled: Some(true),
+                    files: BTreeMap::from([(
+                        "git/.gitconfig".into(),
+                        FileConfig {
+                            when: Some(crate::config::When {
+                                host: vec!["laptop".into()],
+                                ..crate::config::When::default()
+                            }),
+                            ..FileConfig::default()
+                        },
+                    )]),
+                },
+            )]),
+            ..Manifest::default()
+        };
+
+        let result = discover(dir.path(), &manifest, &[], &runtime, &cache).unwrap();
+        assert!(result.desired.is_empty());
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.packages, vec!["git".to_string()]);
     }
 }

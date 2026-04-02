@@ -209,6 +209,15 @@ mod test {
     }
 
     #[test]
+    fn parse_mode_rejects_malformed_strings() {
+        let file = FileConfig {
+            mode: Some("644".into()),
+            ..FileConfig::default()
+        };
+        assert!(file.parsed_mode().is_err());
+    }
+
+    #[test]
     fn symlink_mode_is_rejected() {
         let manifest = Manifest {
             packages: BTreeMap::from([(
@@ -242,5 +251,19 @@ mod test {
         assert!(exists);
         assert_eq!(manifest.settings.default_kind, TargetKind::Symlink);
         assert_eq!(manifest.settings.render_suffix, ".tmpl");
+    }
+
+    #[test]
+    fn append_gitignore_recommendations_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(".gitignore");
+        fs::write(&path, "target\n.DS_Store\n").unwrap();
+
+        append_gitignore_recommendations(dir.path()).unwrap();
+        append_gitignore_recommendations(dir.path()).unwrap();
+
+        let raw = fs::read_to_string(path).unwrap();
+        assert_eq!(raw.lines().filter(|line| *line == ".DS_Store").count(), 1);
+        assert!(raw.lines().any(|line| line == "target"));
     }
 }

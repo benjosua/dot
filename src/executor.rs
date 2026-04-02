@@ -104,10 +104,6 @@ fn execute_operation(op: &Operation) -> Result<()> {
         return Ok(());
     }
 
-    if op.blocked {
-        return Ok(());
-    }
-
     match op.kind {
         OperationKind::EnsureDir => {
             if op.requires_privilege {
@@ -120,7 +116,7 @@ fn execute_operation(op: &Operation) -> Result<()> {
             }
         }
         OperationKind::CreateSymlink | OperationKind::ReplaceSymlink => {
-            if let OperationKind::ReplaceSymlink = op.kind {
+            if op.blocked || matches!(op.kind, OperationKind::ReplaceSymlink) {
                 remove_existing(&op.target, op.requires_privilege)?;
             }
             let source = op.source.as_ref().context("symlink op missing source")?;
@@ -138,7 +134,7 @@ fn execute_operation(op: &Operation) -> Result<()> {
             }
         }
         OperationKind::CreateCopy | OperationKind::ReplaceCopy => {
-            if let OperationKind::ReplaceCopy = op.kind {
+            if op.blocked || matches!(op.kind, OperationKind::ReplaceCopy) {
                 remove_existing(&op.target, op.requires_privilege)?;
             }
             let source = op.source.as_ref().context("copy op missing source")?;
@@ -152,7 +148,7 @@ fn execute_operation(op: &Operation) -> Result<()> {
             }
         }
         OperationKind::CreateRender | OperationKind::ReplaceRender => {
-            if let OperationKind::ReplaceRender = op.kind {
+            if op.blocked || matches!(op.kind, OperationKind::ReplaceRender) {
                 remove_existing(&op.target, op.requires_privilege)?;
             }
             let source = op.source.as_ref().context("render op missing source")?;
@@ -275,5 +271,41 @@ mod test {
 
         let state = state_after_apply("repo".into(), &previous, &plan);
         assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn apply_plan_overwrites_blocked_symlinks_when_confirmed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.txt");
+        let target = dir.path().join("target.txt");
+        stdfs::write(&source, "managed").unwrap();
+        stdfs::write(&target, "manual").unwrap();
+
+        let plan = Plan {
+            operations: vec![Operation {
+                kind: OperationKind::CreateSymlink,
+                package: Some("zsh".into()),
+                target: target.clone(),
+                source: Some(source.clone()),
+                source_rel: Some(PathBuf::from("zsh/.zshrc")),
+                content_hash: Some("abc".into()),
+                requires_privilege: false,
+                blocked: true,
+                reason: Some("target exists with unmanaged changes".into()),
+                diff: None,
+                mode: None,
+            }],
+            diagnostics: Vec::new(),
+            summary: PlanSummary {
+                blocked: 1,
+                ..PlanSummary::default()
+            },
+        };
+
+        apply_plan(&plan, true).unwrap();
+
+        let metadata = stdfs::symlink_metadata(&target).unwrap();
+        assert!(metadata.file_type().is_symlink());
+        assert_eq!(stdfs::read_link(&target).unwrap(), source);
     }
 }
