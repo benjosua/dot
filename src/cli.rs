@@ -4,6 +4,7 @@ use serde::Serialize;
 use simplelog::{ColorChoice, ConfigBuilder, LevelFilter, TermLogger, TerminalMode};
 use std::collections::BTreeMap;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config;
@@ -148,20 +149,37 @@ fn init_logging(verbosity: u8) -> Result<()> {
 fn init_repo(repo_root: &Path) -> Result<()> {
     config::write_default_manifest(repo_root)?;
     config::append_gitignore_recommendations(repo_root)?;
-    let (manifest, _) = config::load_manifest(repo_root)?;
-    let cache_root = state::cache_root(repo_root)?;
-    let runtime = RuntimeContext::detect(None, None);
-    let discovery = discover::discover(repo_root, &manifest, &[], &runtime, &cache_root)?;
     println!("Initialized {}", repo_root.join("dot.toml").display());
-    if discovery.packages.is_empty() {
+    let packages = detected_packages(repo_root)?;
+    if packages.is_empty() {
         println!("No top-level package directories detected yet.");
     } else {
         println!("Detected packages:");
-        for package in discovery.packages {
+        for package in packages {
             println!("  - {package}");
         }
     }
     Ok(())
+}
+
+fn detected_packages(repo_root: &Path) -> Result<Vec<String>> {
+    let mut packages = fs::read_dir(repo_root)
+        .with_context(|| format!("read {}", repo_root.display()))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if matches!(name.as_str(), ".git" | ".github") {
+                return None;
+            }
+            Some(name)
+        })
+        .collect::<Vec<_>>();
+    packages.sort();
+    Ok(packages)
 }
 
 fn compute_plan(
@@ -238,7 +256,7 @@ fn undeploy(repo_root: &Path, packages: &[String], yes: bool) -> Result<()> {
     executor::apply_plan(&plan, yes)?;
     let mut next = current_state.clone();
     next.entries
-        .retain(|entry| wanted.is_empty() || !wanted.contains_key(&entry.package));
+        .retain(|entry| !wanted.is_empty() && !wanted.contains_key(&entry.package));
     state::save(repo_root, &next)?;
     print_plan(&plan);
     Ok(())
