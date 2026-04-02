@@ -22,6 +22,74 @@ pub enum CollisionPolicy {
     Error,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConflictAction {
+    #[default]
+    Block,
+    Overwrite,
+    Merge,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PrivilegeAction {
+    #[default]
+    SkipPackage,
+    Apply,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ConflictConfig {
+    pub unmanaged: Option<ConflictAction>,
+    pub managed: Option<ConflictAction>,
+    pub privileged: Option<PrivilegeAction>,
+    pub merge_tool: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConflictRules {
+    pub unmanaged: ConflictAction,
+    pub managed: ConflictAction,
+    pub privileged: PrivilegeAction,
+    pub merge_tool: Option<String>,
+}
+
+impl Default for ConflictRules {
+    fn default() -> Self {
+        Self {
+            unmanaged: ConflictAction::Block,
+            managed: ConflictAction::Block,
+            privileged: PrivilegeAction::SkipPackage,
+            merge_tool: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ConflictOverrides {
+    pub unmanaged: Option<ConflictAction>,
+    pub managed: Option<ConflictAction>,
+    pub privileged: Option<PrivilegeAction>,
+}
+
+impl ConflictConfig {
+    fn merge_into(&self, rules: &mut ConflictRules) {
+        if let Some(unmanaged) = self.unmanaged {
+            rules.unmanaged = unmanaged;
+        }
+        if let Some(managed) = self.managed {
+            rules.managed = managed;
+        }
+        if let Some(privileged) = self.privileged {
+            rules.privileged = privileged;
+        }
+        if let Some(merge_tool) = &self.merge_tool {
+            rules.merge_tool = Some(merge_tool.clone());
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OsSelector {
@@ -46,6 +114,8 @@ pub struct FileConfig {
     pub kind: Option<TargetKind>,
     pub mode: Option<String>,
     pub when: Option<When>,
+    #[serde(default)]
+    pub conflicts: ConflictConfig,
 }
 
 impl FileConfig {
@@ -70,6 +140,8 @@ pub struct PackageConfig {
     pub enabled: Option<bool>,
     #[serde(default)]
     pub files: BTreeMap<String, FileConfig>,
+    #[serde(default)]
+    pub conflicts: ConflictConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +152,8 @@ pub struct Settings {
     pub render_suffix: String,
     #[serde(default)]
     pub collision_policy: CollisionPolicy,
+    #[serde(default)]
+    pub conflicts: ConflictConfig,
 }
 
 impl Default for Settings {
@@ -88,6 +162,7 @@ impl Default for Settings {
             default_kind: TargetKind::Symlink,
             render_suffix: default_render_suffix(),
             collision_policy: CollisionPolicy::Error,
+            conflicts: ConflictConfig::default(),
         }
     }
 }
@@ -134,6 +209,35 @@ pub fn validate_manifest(manifest: &Manifest) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn resolve_conflict_rules(
+    manifest: &Manifest,
+    package_name: &str,
+    source_rel: Option<&Path>,
+    overrides: &ConflictOverrides,
+) -> ConflictRules {
+    let mut rules = ConflictRules::default();
+    manifest.settings.conflicts.merge_into(&mut rules);
+    if let Some(package) = manifest.packages.get(package_name) {
+        package.conflicts.merge_into(&mut rules);
+        if let Some(source_rel) = source_rel {
+            let source_key = source_rel.display().to_string();
+            if let Some(file) = package.files.get(&source_key) {
+                file.conflicts.merge_into(&mut rules);
+            }
+        }
+    }
+    if let Some(unmanaged) = overrides.unmanaged {
+        rules.unmanaged = unmanaged;
+    }
+    if let Some(managed) = overrides.managed {
+        rules.managed = managed;
+    }
+    if let Some(privileged) = overrides.privileged {
+        rules.privileged = privileged;
+    }
+    rules
 }
 
 pub fn write_default_manifest(repo_root: &Path) -> Result<()> {
@@ -232,6 +336,7 @@ mod test {
                             ..FileConfig::default()
                         },
                     )]),
+                    ..PackageConfig::default()
                 },
             )]),
             ..Manifest::default()
@@ -265,5 +370,58 @@ mod test {
         let raw = fs::read_to_string(path).unwrap();
         assert_eq!(raw.lines().filter(|line| *line == ".DS_Store").count(), 1);
         assert!(raw.lines().any(|line| line == "target"));
+    }
+
+    #[test]
+    fn resolve_conflict_rules_uses_file_package_settings_and_cli_precedence() {
+        let manifest = Manifest {
+            settings: Settings {
+                conflicts: ConflictConfig {
+                    unmanaged: Some(ConflictAction::Block),
+                    managed: Some(ConflictAction::Block),
+                    privileged: Some(PrivilegeAction::SkipPackage),
+                    merge_tool: Some("meld".into()),
+                },
+                ..Settings::default()
+            },
+            packages: BTreeMap::from([(
+                "git".into(),
+                PackageConfig {
+                    conflicts: ConflictConfig {
+                        unmanaged: Some(ConflictAction::Merge),
+                        managed: None,
+                        privileged: Some(PrivilegeAction::Apply),
+                        merge_tool: Some("opendiff".into()),
+                    },
+                    files: BTreeMap::from([(
+                        "git/.config/git/config.tmpl".into(),
+                        FileConfig {
+                            conflicts: ConflictConfig {
+                                managed: Some(ConflictAction::Overwrite),
+                                ..ConflictConfig::default()
+                            },
+                            ..FileConfig::default()
+                        },
+                    )]),
+                    ..PackageConfig::default()
+                },
+            )]),
+            ..Manifest::default()
+        };
+
+        let rules = resolve_conflict_rules(
+            &manifest,
+            "git",
+            Some(Path::new("git/.config/git/config.tmpl")),
+            &ConflictOverrides {
+                unmanaged: Some(ConflictAction::Overwrite),
+                ..ConflictOverrides::default()
+            },
+        );
+
+        assert_eq!(rules.unmanaged, ConflictAction::Overwrite);
+        assert_eq!(rules.managed, ConflictAction::Overwrite);
+        assert_eq!(rules.privileged, PrivilegeAction::Apply);
+        assert_eq!(rules.merge_tool.as_deref(), Some("opendiff"));
     }
 }

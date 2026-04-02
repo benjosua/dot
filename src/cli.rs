@@ -11,7 +11,7 @@ use crate::config;
 use crate::discover;
 use crate::doctor;
 use crate::executor;
-use crate::planner::{self, Operation, OperationKind, Plan};
+use crate::planner::{self, ConflictKind, Operation, OperationKind, Plan, PlanOptions};
 use crate::selectors::{RuntimeContext, RuntimeOs};
 use crate::state;
 
@@ -48,6 +48,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     yes: bool,
     #[arg(long, global = true)]
+    overwrite_unmanaged: bool,
+    #[arg(long, global = true)]
+    overwrite_drift: bool,
+    #[arg(long, global = true)]
+    allow_privileged: bool,
+    #[arg(long, global = true)]
     no_render_diff: bool,
     #[command(subcommand)]
     command: Command,
@@ -74,6 +80,8 @@ struct StatusReport {
     missing_source: usize,
     missing_target: usize,
     state_mismatch: usize,
+    skipped_privileged: usize,
+    merge_required: usize,
 }
 
 pub fn run() -> Result<()> {
@@ -85,11 +93,25 @@ pub fn run() -> Result<()> {
         .clone()
         .unwrap_or(env::current_dir().context("get current working directory")?);
     let runtime = RuntimeContext::detect(cli.host.clone(), cli.os.map(Into::into));
+    let plan_options = PlanOptions {
+        no_render_diff: cli.no_render_diff,
+        conflict_overrides: config::ConflictOverrides {
+            unmanaged: cli
+                .overwrite_unmanaged
+                .then_some(config::ConflictAction::Overwrite),
+            managed: cli
+                .overwrite_drift
+                .then_some(config::ConflictAction::Overwrite),
+            privileged: cli
+                .allow_privileged
+                .then_some(config::PrivilegeAction::Apply),
+        },
+    };
 
     match &cli.command {
         Command::Init => init_repo(&repo_root),
         Command::Plan { packages } => {
-            let plan = compute_plan(&repo_root, packages, &runtime, cli.no_render_diff)?;
+            let plan = compute_plan(&repo_root, packages, &runtime, &plan_options)?;
             if cli.json {
                 print_json(&plan)
             } else {
@@ -98,10 +120,10 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Apply { packages } => {
-            apply(&repo_root, packages, &runtime, cli.no_render_diff, cli.yes)
+            apply(&repo_root, packages, &runtime, &plan_options, cli.yes)
         }
         Command::Status { packages } => {
-            let plan = compute_plan(&repo_root, packages, &runtime, cli.no_render_diff)?;
+            let plan = compute_plan(&repo_root, packages, &runtime, &plan_options)?;
             let report = status_report(&plan);
             if cli.json {
                 print_json(&report)
@@ -111,7 +133,7 @@ pub fn run() -> Result<()> {
             }
         }
         Command::Doctor { packages } => {
-            let plan = compute_plan(&repo_root, packages, &runtime, cli.no_render_diff)?;
+            let plan = compute_plan(&repo_root, packages, &runtime, &plan_options)?;
             let report = doctor::diagnose(&plan)?;
             if cli.json {
                 print_json(&report)
@@ -186,32 +208,34 @@ fn compute_plan(
     repo_root: &Path,
     packages: &[String],
     runtime: &RuntimeContext,
-    no_render_diff: bool,
+    options: &PlanOptions,
 ) -> Result<Plan> {
     let (manifest, _) = config::load_manifest(repo_root)?;
     let cache_root = state::cache_root(repo_root)?;
     let discovery = discover::discover(repo_root, &manifest, packages, runtime, &cache_root)?;
     let current_state = state::load(repo_root)?;
-    planner::build_plan(&manifest, discovery, &current_state, no_render_diff)
+    planner::build_plan(&manifest, discovery, &current_state, options)
 }
 
 fn apply(
     repo_root: &Path,
     packages: &[String],
     runtime: &RuntimeContext,
-    no_render_diff: bool,
-    yes: bool,
+    options: &PlanOptions,
+    _yes: bool,
 ) -> Result<()> {
-    let plan = compute_plan(repo_root, packages, runtime, no_render_diff)?;
+    let plan = compute_plan(repo_root, packages, runtime, options)?;
     if plan_has_errors(&plan) {
         print_plan(&plan);
         bail!("refusing to apply a plan with validation errors");
     }
-    if !yes && plan.operations.iter().any(|op| op.blocked) {
+    if plan.operations.iter().any(|op| op.blocked) {
         print_plan(&plan);
-        bail!("blocked operations require --yes");
+        bail!(
+            "blocked operations remain after applying conflict policies; resolve the conflicts, update dot.toml, or use --overwrite-unmanaged/--overwrite-drift"
+        );
     }
-    executor::apply_plan(&plan, yes)?;
+    executor::apply_plan(&plan)?;
     let previous = state::load(repo_root)?;
     let new_state = executor::state_after_apply(state::repo_id(repo_root)?, &previous, &plan);
     state::save(repo_root, &new_state)?;
@@ -219,7 +243,7 @@ fn apply(
     Ok(())
 }
 
-fn undeploy(repo_root: &Path, packages: &[String], yes: bool) -> Result<()> {
+fn undeploy(repo_root: &Path, packages: &[String], _yes: bool) -> Result<()> {
     let current_state = state::load(repo_root)?;
     let wanted = package_filter(packages);
     let mut operations = Vec::new();
@@ -240,8 +264,11 @@ fn undeploy(repo_root: &Path, packages: &[String], yes: bool) -> Result<()> {
             content_hash: Some(entry.content_hash.clone()),
             requires_privilege: crate::fs::parent_requires_privilege(Path::new(&entry.target)),
             blocked: false,
+            skipped: false,
             reason: None,
             diff: None,
+            conflict_kind: None,
+            merge_command: None,
             mode: None,
         });
     }
@@ -253,7 +280,7 @@ fn undeploy(repo_root: &Path, packages: &[String], yes: bool) -> Result<()> {
         diagnostics: Vec::new(),
         operations,
     };
-    executor::apply_plan(&plan, yes)?;
+    executor::apply_plan(&plan)?;
     let mut next = current_state.clone();
     next.entries
         .retain(|entry| !wanted.is_empty() && !wanted.contains_key(&entry.package));
@@ -273,6 +300,8 @@ fn status_report(plan: &Plan) -> StatusReport {
         missing_source: 0,
         missing_target: 0,
         state_mismatch: 0,
+        skipped_privileged: plan.summary.skipped_privileged,
+        merge_required: plan.summary.merge_required,
     };
 
     for diagnostic in &plan.diagnostics {
@@ -282,15 +311,15 @@ fn status_report(plan: &Plan) -> StatusReport {
     }
 
     for op in &plan.operations {
+        if op.skipped {
+            continue;
+        }
         match op.kind {
             OperationKind::CreateSymlink
             | OperationKind::CreateCopy
             | OperationKind::CreateRender => {
                 report.pending_create += 1;
-                if matches!(
-                    op.reason.as_deref(),
-                    Some("target exists with unmanaged changes")
-                ) {
+                if matches!(op.conflict_kind, Some(ConflictKind::UnmanagedExisting)) {
                     report.unmanaged_target_changes += 1;
                 } else {
                     report.missing_target += 1;
@@ -300,21 +329,18 @@ fn status_report(plan: &Plan) -> StatusReport {
             | OperationKind::ReplaceCopy
             | OperationKind::ReplaceRender => {
                 report.pending_replace += 1;
-                if matches!(
-                    op.reason.as_deref(),
-                    Some("target exists with unmanaged changes")
-                ) {
+                if matches!(op.conflict_kind, Some(ConflictKind::UnmanagedExisting)) {
                     report.unmanaged_target_changes += 1;
+                }
+                if matches!(op.conflict_kind, Some(ConflictKind::ManagedDrift)) {
+                    report.state_mismatch += 1;
                 }
             }
             OperationKind::RemoveSymlink
             | OperationKind::RemoveCopy
             | OperationKind::RemoveRender => {
                 report.pending_remove += 1;
-                if matches!(
-                    op.reason.as_deref(),
-                    Some("managed target drifted since last apply")
-                ) {
+                if matches!(op.conflict_kind, Some(ConflictKind::ManagedDrift)) {
                     report.state_mismatch += 1;
                 }
             }
@@ -330,7 +356,13 @@ fn print_plan(plan: &Plan) {
         println!("{:?}: {}", diagnostic.severity, diagnostic.message);
     }
     for op in &plan.operations {
-        let blocked = if op.blocked { " [blocked]" } else { "" };
+        let blocked = if op.blocked {
+            " [blocked]"
+        } else if op.skipped {
+            " [skipped]"
+        } else {
+            ""
+        };
         let detail = op
             .reason
             .as_ref()
@@ -340,13 +372,29 @@ fn print_plan(plan: &Plan) {
         if let Some(diff) = &op.diff {
             println!("{diff}");
         }
+        if op.blocked && merge_required(op) {
+            if op.diff.is_some()
+                && let Some(source) = &op.source
+            {
+                println!(
+                    "diff command: git diff --no-index -- {} {}",
+                    op.target.display(),
+                    source.display()
+                );
+            }
+            if let Some(command) = &op.merge_command {
+                println!("merge command: {command}");
+            }
+        }
     }
     println!(
-        "summary: create={} replace={} remove={} blocked={} clean={}",
+        "summary: create={} replace={} remove={} blocked={} skipped_privileged={} merge_required={} clean={}",
         plan.summary.create,
         plan.summary.replace,
         plan.summary.remove,
         plan.summary.blocked,
+        plan.summary.skipped_privileged,
+        plan.summary.merge_required,
         plan.summary.clean
     );
 }
@@ -364,6 +412,8 @@ fn print_status(report: &StatusReport) {
     println!("missing source: {}", report.missing_source);
     println!("missing target: {}", report.missing_target);
     println!("state mismatch: {}", report.state_mismatch);
+    println!("skipped privileged: {}", report.skipped_privileged);
+    println!("merge required: {}", report.merge_required);
 }
 
 fn print_json<T: Serialize>(value: &T) -> Result<()> {
@@ -388,6 +438,15 @@ fn plan_has_errors(plan: &Plan) -> bool {
         .any(|diagnostic| matches!(diagnostic.severity, planner::Severity::Error))
 }
 
+fn merge_required(op: &Operation) -> bool {
+    op.blocked
+        && matches!(
+            op.reason.as_deref(),
+            Some(reason) if reason.contains("requires manual merge")
+                || reason.contains("merge requested")
+        )
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -405,8 +464,11 @@ mod test {
                     content_hash: Some("abc".into()),
                     requires_privilege: false,
                     blocked: true,
+                    skipped: false,
                     reason: Some("target exists with unmanaged changes".into()),
                     diff: None,
+                    conflict_kind: Some(ConflictKind::UnmanagedExisting),
+                    merge_command: None,
                     mode: Some(0o644),
                 },
                 Operation {
@@ -418,8 +480,11 @@ mod test {
                     content_hash: Some("def".into()),
                     requires_privilege: false,
                     blocked: true,
+                    skipped: false,
                     reason: Some("managed target drifted since last apply".into()),
                     diff: None,
+                    conflict_kind: Some(ConflictKind::ManagedDrift),
+                    merge_command: None,
                     mode: None,
                 },
             ],

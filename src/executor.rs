@@ -9,12 +9,16 @@ use crate::planner::{Operation, OperationKind, Plan};
 use crate::privilege;
 use crate::state::{StateEntry, StateFile};
 
-pub fn apply_plan(plan: &Plan, yes: bool) -> Result<()> {
-    if plan.operations.iter().any(|op| op.blocked) && !yes {
-        bail!("plan contains blocked operations; rerun with --yes to overwrite unmanaged drift");
+pub fn apply_plan(plan: &Plan) -> Result<()> {
+    if plan.operations.iter().any(|op| op.blocked) {
+        bail!("plan contains blocked operations");
     }
 
-    if plan.operations.iter().any(|op| op.requires_privilege) {
+    if plan
+        .operations
+        .iter()
+        .any(|op| op.requires_privilege && !op.skipped)
+    {
         privilege::ensure_sudo_session()?;
     }
 
@@ -28,6 +32,9 @@ pub fn apply_plan(plan: &Plan, yes: bool) -> Result<()> {
 pub fn build_state_entries(plan: &Plan) -> Vec<StateEntry> {
     let mut entries = Vec::new();
     for op in &plan.operations {
+        if op.skipped {
+            continue;
+        }
         let Some(package) = &op.package else {
             continue;
         };
@@ -79,6 +86,9 @@ pub fn state_after_apply(repo_id: String, previous: &StateFile, plan: &Plan) -> 
     let mut by_target = previous.by_target();
 
     for op in &plan.operations {
+        if op.skipped {
+            continue;
+        }
         match op.kind {
             OperationKind::RemoveSymlink
             | OperationKind::RemoveCopy
@@ -101,6 +111,10 @@ pub fn state_after_apply(repo_id: String, previous: &StateFile, plan: &Plan) -> 
 
 fn execute_operation(op: &Operation) -> Result<()> {
     if matches!(op.kind, OperationKind::PrivilegedStat) {
+        return Ok(());
+    }
+
+    if op.skipped {
         return Ok(());
     }
 
@@ -216,8 +230,11 @@ mod test {
                 content_hash: Some("rendered-hash".into()),
                 requires_privilege: false,
                 blocked: false,
+                skipped: false,
                 reason: None,
                 diff: None,
+                conflict_kind: None,
+                merge_command: None,
                 mode: Some(0o644),
             }],
             diagnostics: Vec::new(),
@@ -261,8 +278,11 @@ mod test {
                 content_hash: Some("old".into()),
                 requires_privilege: false,
                 blocked: false,
+                skipped: false,
                 reason: None,
                 diff: None,
+                conflict_kind: None,
+                merge_command: None,
                 mode: None,
             }],
             diagnostics: Vec::new(),
@@ -274,7 +294,7 @@ mod test {
     }
 
     #[test]
-    fn apply_plan_overwrites_blocked_symlinks_when_confirmed() {
+    fn apply_plan_rejects_blocked_operations() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source.txt");
         let target = dir.path().join("target.txt");
@@ -291,8 +311,11 @@ mod test {
                 content_hash: Some("abc".into()),
                 requires_privilege: false,
                 blocked: true,
+                skipped: false,
                 reason: Some("target exists with unmanaged changes".into()),
                 diff: None,
+                conflict_kind: Some(crate::planner::ConflictKind::UnmanagedExisting),
+                merge_command: None,
                 mode: None,
             }],
             diagnostics: Vec::new(),
@@ -302,10 +325,6 @@ mod test {
             },
         };
 
-        apply_plan(&plan, true).unwrap();
-
-        let metadata = stdfs::symlink_metadata(&target).unwrap();
-        assert!(metadata.file_type().is_symlink());
-        assert_eq!(stdfs::read_link(&target).unwrap(), source);
+        assert!(apply_plan(&plan).is_err());
     }
 }

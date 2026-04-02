@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -73,6 +74,21 @@ impl TestEnv {
             .unwrap()
     }
 
+    fn run_with_path(&self, args: &[&str], path_prefix: &Path) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_dot"))
+            .args(["--repo", self.repo.to_str().unwrap()])
+            .args(args)
+            .env("HOME", &self.home)
+            .env("XDG_STATE_HOME", &self.state)
+            .env("XDG_CACHE_HOME", &self.cache)
+            .env(
+                "PATH",
+                format!("{}:{}", path_prefix.display(), env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    }
+
     fn render_command(&self, args: &[&str]) -> String {
         let mut parts = vec![
             env!("CARGO_BIN_EXE_dot").to_string(),
@@ -99,6 +115,15 @@ fn state_file_path(state_root: &Path) -> PathBuf {
         .unwrap()
         .path();
     repo_state_root.join("state.json")
+}
+
+fn install_fake_sudo(bin_dir: &Path) {
+    let sudo = bin_dir.join("sudo");
+    write(
+        &sudo,
+        "#!/usr/bin/env bash\nset -euo pipefail\nif [[ \"${1:-}\" == \"-v\" ]]; then\n  exit 0\nfi\ncmd=\"$1\"\nshift\nif [[ \"$#\" -gt 0 ]]; then\n  target=\"${!#}\"\n  if [[ -n \"$target\" ]]; then\n    chmod u+w \"$(dirname \"$target\")\" 2>/dev/null || true\n  fi\nfi\nexec \"$cmd\" \"$@\"\n",
+    );
+    fs::set_permissions(&sudo, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 #[test]
@@ -193,7 +218,7 @@ fn full_cli_flow_applies_reports_and_undeploys() {
 }
 
 #[test]
-fn apply_requires_yes_to_replace_unmanaged_targets() {
+fn apply_requires_explicit_overwrite_policy_for_unmanaged_targets() {
     let env = TestEnv::new();
     write(&env.repo.join("zsh/.zshrc"), "export EDITOR=vim\n");
 
@@ -206,11 +231,121 @@ fn apply_requires_yes_to_replace_unmanaged_targets() {
 
     let failed_apply = env.run_failure(&["apply"]);
     let stderr = String::from_utf8(failed_apply.stderr).unwrap();
-    assert!(stderr.contains("blocked operations require --yes"));
+    assert!(stderr.contains("--overwrite-unmanaged"));
 
-    env.run_success(&["--yes", "apply"]);
+    env.run_success(&["--overwrite-unmanaged", "apply"]);
     assert_eq!(
         fs::read_link(env.home.join(".zshrc")).unwrap(),
         env.repo.join("zsh/.zshrc")
     );
+}
+
+#[test]
+fn per_file_unmanaged_overwrite_policy_replaces_manual_target_without_flag() {
+    let env = TestEnv::new();
+    write(&env.repo.join("zsh/.zshrc"), "export EDITOR=vim\n");
+
+    env.run_success(&["init"]);
+    write(
+        &env.repo.join("dot.toml"),
+        "[packages.zsh.files.\"zsh/.zshrc\".conflicts]\nunmanaged = \"overwrite\"\n",
+    );
+    write(&env.home.join(".zshrc"), "manually managed\n");
+
+    env.run_success(&["apply"]);
+
+    assert_eq!(
+        fs::read_link(env.home.join(".zshrc")).unwrap(),
+        env.repo.join("zsh/.zshrc")
+    );
+}
+
+#[test]
+fn managed_merge_policy_blocks_apply_and_prints_guidance() {
+    let env = TestEnv::new();
+    write(&env.repo.join("git/.gitconfig"), "[user]\nemail = \"new@example.test\"\n");
+
+    env.run_success(&["init"]);
+    write(
+        &env.repo.join("dot.toml"),
+        "[settings.conflicts]\nmerge_tool = \"opendiff\"\n\n[packages.git.files.\"git/.gitconfig\"]\ntarget = \"~/.gitconfig\"\nkind = \"copy\"\n\n[packages.git.files.\"git/.gitconfig\".conflicts]\nmanaged = \"merge\"\n",
+    );
+
+    env.run_success(&["apply"]);
+    write(
+        &env.home.join(".gitconfig"),
+        "[user]\nemail = \"manual@example.test\"\n",
+    );
+
+    let failed_apply = env.run_failure(&["apply"]);
+    let stdout = String::from_utf8(failed_apply.stdout).unwrap();
+    let stderr = String::from_utf8(failed_apply.stderr).unwrap();
+
+    assert!(stdout.contains("[blocked]"));
+    assert!(stdout.contains("diff command: git diff --no-index"));
+    assert!(stdout.contains("merge command: opendiff"));
+    assert!(stderr.contains("blocked operations remain after applying conflict policies"));
+    assert_eq!(
+        fs::read_to_string(env.home.join(".gitconfig")).unwrap(),
+        "[user]\nemail = \"manual@example.test\"\n"
+    );
+
+    let state_json = state_file_path(&env.state);
+    let state: Value = serde_json::from_str(&fs::read_to_string(state_json).unwrap()).unwrap();
+    assert_eq!(state["entries"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn privileged_packages_are_skipped_by_default_and_can_be_allowed() {
+    let env = TestEnv::new();
+    let protected_root = env.home.join("protected");
+    fs::create_dir_all(&protected_root).unwrap();
+    fs::set_permissions(&protected_root, fs::Permissions::from_mode(0o555)).unwrap();
+
+    write(&env.repo.join("zsh/.zshrc"), "export EDITOR=vim\n");
+    write(&env.repo.join("sys/app.conf"), "port=8080\n");
+
+    env.run_success(&["init"]);
+    write(
+        &env.repo.join("dot.toml"),
+        &format!(
+            "[packages.sys.files.\"sys/app.conf\"]\ntarget = \"{}\"\nkind = \"copy\"\n",
+            protected_root.join("app.conf").display()
+        ),
+    );
+
+    let first_apply = env.run_success(&["apply"]);
+    let first_stdout = String::from_utf8(first_apply.stdout).unwrap();
+    assert!(first_stdout.contains("[skipped]"));
+    assert!(env.home.join(".zshrc").exists());
+    assert!(!protected_root.join("app.conf").exists());
+
+    let status_after_skip = env.run_json(&["--json", "status"]);
+    assert_eq!(status_after_skip["skipped_privileged"], 2);
+
+    let state_json = state_file_path(&env.state);
+    let state: Value = serde_json::from_str(&fs::read_to_string(&state_json).unwrap()).unwrap();
+    assert_eq!(state["entries"].as_array().unwrap().len(), 1);
+
+    let bin_dir = env.home.join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    install_fake_sudo(&bin_dir);
+
+    let second_apply = env.run_with_path(&["--allow-privileged", "apply"], &bin_dir);
+    assert!(
+        second_apply.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&second_apply.stdout),
+        String::from_utf8_lossy(&second_apply.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(protected_root.join("app.conf")).unwrap(),
+        "port=8080\n"
+    );
+
+    let status_after_allow = env.run_with_path(&["--json", "--allow-privileged", "status"], &bin_dir);
+    assert!(status_after_allow.status.success());
+    let json: Value = serde_json::from_slice(&status_after_allow.stdout).unwrap();
+    assert_eq!(json["skipped_privileged"], 0);
+    fs::set_permissions(&protected_root, fs::Permissions::from_mode(0o755)).unwrap();
 }

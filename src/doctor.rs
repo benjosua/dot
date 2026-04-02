@@ -29,6 +29,24 @@ pub fn diagnose(plan: &Plan) -> Result<DoctorReport> {
             ),
         });
     }
+    if plan.summary.skipped_privileged > 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "{} operation(s) were skipped because privilege is disabled",
+                plan.summary.skipped_privileged
+            ),
+        });
+    }
+    if plan.summary.merge_required > 0 {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Warning,
+            message: format!(
+                "{} operation(s) require a manual merge before dot can continue",
+                plan.summary.merge_required
+            ),
+        });
+    }
     if plan.operations.is_empty() && plan.summary.clean == 0 && diagnostics.is_empty() {
         diagnostics.push(Diagnostic::warning(
             "no managed packages were discovered; check your repo layout or selected packages",

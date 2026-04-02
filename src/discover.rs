@@ -366,6 +366,7 @@ mod test {
                         "git/.config/git/config".into(),
                         FileConfig::default(),
                     )]),
+                    ..crate::config::PackageConfig::default()
                 },
             )]),
             ..Manifest::default()
@@ -407,6 +408,7 @@ mod test {
                             ..FileConfig::default()
                         },
                     )]),
+                    ..crate::config::PackageConfig::default()
                 },
             )]),
             ..Manifest::default()
