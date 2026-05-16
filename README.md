@@ -108,6 +108,7 @@ Conflict policy precedence is file -> package -> settings. Available actions are
 - replacements are first-class operations
 - unmanaged targets and managed drift are governed by explicit conflict policy
 - `--overwrite-unmanaged` and `--overwrite-drift` are one-shot overrides
+- `--yes` applies both overwrite overrides for compatibility with confirmation-style workflows
 - merge-required conflicts print diff and merge-tool guidance without launching tools automatically
 - packages that require privilege are skipped by default unless you pass `--allow-privileged`
 - unreadable targets are surfaced as privileged inspection steps

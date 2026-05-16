@@ -241,6 +241,43 @@ fn apply_requires_explicit_overwrite_policy_for_unmanaged_targets() {
 }
 
 #[test]
+fn yes_overwrites_unmanaged_targets_and_managed_drift() {
+    let env = TestEnv::new();
+    write(&env.repo.join("zsh/.zshrc"), "export EDITOR=vim\n");
+    write(
+        &env.repo.join("git/.gitconfig"),
+        "[user]\nemail = \"new@example.test\"\n",
+    );
+
+    env.run_success(&["init"]);
+    write(
+        &env.repo.join("dot.toml"),
+        "[packages.git.files.\"git/.gitconfig\"]\ntarget = \"~/.gitconfig\"\nkind = \"copy\"\n",
+    );
+
+    write(&env.home.join(".zshrc"), "manually managed\n");
+    env.run_success(&["--yes", "apply"]);
+    assert_eq!(
+        fs::read_link(env.home.join(".zshrc")).unwrap(),
+        env.repo.join("zsh/.zshrc")
+    );
+
+    write(
+        &env.home.join(".gitconfig"),
+        "[user]\nemail = \"manual@example.test\"\n",
+    );
+    let status = env.run_json(&["--json", "status"]);
+    assert_eq!(status["blocked"], 1);
+    assert_eq!(status["state_mismatch"], 1);
+
+    env.run_success(&["--yes", "apply"]);
+    assert_eq!(
+        fs::read_to_string(env.home.join(".gitconfig")).unwrap(),
+        "[user]\nemail = \"new@example.test\"\n"
+    );
+}
+
+#[test]
 fn per_file_unmanaged_overwrite_policy_replaces_manual_target_without_flag() {
     let env = TestEnv::new();
     write(&env.repo.join("zsh/.zshrc"), "export EDITOR=vim\n");

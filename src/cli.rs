@@ -93,15 +93,13 @@ pub fn run() -> Result<()> {
         .clone()
         .unwrap_or(env::current_dir().context("get current working directory")?);
     let runtime = RuntimeContext::detect(cli.host.clone(), cli.os.map(Into::into));
+    let overwrite_unmanaged = cli.yes || cli.overwrite_unmanaged;
+    let overwrite_drift = cli.yes || cli.overwrite_drift;
     let plan_options = PlanOptions {
         no_render_diff: cli.no_render_diff,
         conflict_overrides: config::ConflictOverrides {
-            unmanaged: cli
-                .overwrite_unmanaged
-                .then_some(config::ConflictAction::Overwrite),
-            managed: cli
-                .overwrite_drift
-                .then_some(config::ConflictAction::Overwrite),
+            unmanaged: overwrite_unmanaged.then_some(config::ConflictAction::Overwrite),
+            managed: overwrite_drift.then_some(config::ConflictAction::Overwrite),
             privileged: cli
                 .allow_privileged
                 .then_some(config::PrivilegeAction::Apply),
